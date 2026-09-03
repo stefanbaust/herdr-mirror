@@ -463,6 +463,9 @@ pub(crate) fn cmd_for_pane(
         let mut argv = vec![
             exe.clone(),
             "pane".into(),
+            // Marker für die Wiedererkennung; steht vor den optionalen Flags,
+            // damit die argv-Form stabil bleibt.
+            "--mirror-streamer".into(),
             target.clone(),
             pane_id.to_string(),
         ];
@@ -1854,6 +1857,7 @@ mod tests {
             argv[1..],
             [
                 "pane",
+                "--mirror-streamer",
                 "vps",
                 "w1:p1",
                 // no --remote-bin: auto (PATH then ~/.local/bin/herdr)
@@ -1878,6 +1882,7 @@ mod tests {
             argv[1..],
             [
                 "pane",
+                "--mirror-streamer",
                 "vps",
                 "w1:p1",
                 "--remote-bin",
@@ -1899,6 +1904,7 @@ mod tests {
             argv[1..],
             [
                 "pane",
+                "--mirror-streamer",
                 "vps",
                 "w1:p1",
                 "--session",
@@ -1927,6 +1933,7 @@ mod tests {
             argv[1..],
             [
                 "pane",
+                "--mirror-streamer",
                 "/Users/n/proj",
                 "w1:p1",
                 "--always-control",
@@ -1971,7 +1978,7 @@ mod tests {
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
-            ["pane", "vps", "w1:p1", "--ctl-path", "/state/vps.ctl"]
+            ["pane", "--mirror-streamer", "vps", "w1:p1", "--ctl-path", "/state/vps.ctl"]
         );
     }
 
