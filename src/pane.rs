@@ -871,7 +871,13 @@ impl App {
         // Der Zielname wird aus demselben Helfer abgeleitet, den auch der Daemon
         // beim Anlegen benutzt — eine Quelle, keine zweite Meinung.
         let want = crate::mirror::streamer_exe(&env.state_dir, &self.exe_original, agent);
-        if current.display().to_string() == want {
+        // Verglichen wird der DATEINAME, nicht der Pfad: bei einem ersetzten
+        // Binary hängt current_exe() " (deleted)" an, ein Pfadvergleich wäre
+        // dann nie gleich — der Streamer exec'te sich bei jeder Abfrage neu.
+        let have = current.file_name().map(|n| n.to_string_lossy().into_owned());
+        let want_name =
+            std::path::Path::new(&want).file_name().map(|n| n.to_string_lossy().into_owned());
+        if have.is_some() && have == want_name {
             return;
         }
         let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1556,11 +1562,7 @@ pub async fn run(args: Args) -> Result<()> {
         hint_clear_at: None,
         predict: Predictor::new(),
         remote_fg: None,
-        exe_original: std::fs::canonicalize(
-            std::env::current_exe().unwrap_or_else(|_| "herdr-mirror".into()),
-        )
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "herdr-mirror".into()),
+        exe_original: crate::mirror::own_exe_path(),
         select: Select::new(),
         last_select_rows: None,
         fg_poll_at: None,

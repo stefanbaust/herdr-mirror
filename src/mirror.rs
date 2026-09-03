@@ -472,25 +472,62 @@ pub(crate) fn streamer_exe(
     }
     let link = dir.join(agent);
     // Ein vorhandener Link kann auf ein ALTES Binary zeigen (Plugin-Update), also
-    // jedes Mal neu setzen. Gleiche Inode = nichts zu tun.
-    let same = std::fs::metadata(&link).ok().zip(std::fs::metadata(exe).ok()).is_some_and(
+    // jedes Mal prüfen. Verglichen wird gegen /proc/self/exe statt gegen `exe`:
+    // der PFAD des laufenden Binaries ist regelmäßig weg — ein `cargo build`
+    // ersetzt die Inode unter target/release, der Daemon läuft danach als
+    // "(deleted)" weiter —, /proc/self/exe zeigt trotzdem noch auf die richtige
+    // Datei.
+    let running = std::path::Path::new("/proc/self/exe");
+    let same = std::fs::metadata(&link).ok().zip(std::fs::metadata(running).ok()).is_some_and(
         |(a, b)| {
             use std::os::unix::fs::MetadataExt;
             a.dev() == b.dev() && a.ino() == b.ino()
         },
     );
     if !same {
-        let _ = std::fs::remove_file(&link);
-        if std::fs::hard_link(exe, &link).is_err() {
-            // getrennte Dateisysteme: Kopie tut es auch, der Name zählt
-            if std::fs::copy(exe, &link).is_err() {
-                return exe.to_string();
-            }
+        // Erst das Neue bauen, dann atomar darüberlegen — NIEMALS den
+        // vorhandenen Link vorher wegwerfen.
+        //
+        // Genau daran ist es live gescheitert (2026-09-03, Worker ada): war
+        // `exe` gelöscht, blieb nach dem remove_file weder ein Link noch ein
+        // Ersatz übrig. Jeder Streamer, der sich später umbenennen wollte, lief
+        // damit ins Leere und blieb still unter seinem eigenen Namen — herdr gab
+        // der Spiegel-Pane keine Agenten-Autorität, das Handy zeigte einen
+        // Agenten ohne Verlauf. Still deshalb, weil hier absichtlich jeder
+        // Fehler geschluckt wird.
+        let tmp = dir.join(format!(".{agent}.neu"));
+        let _ = std::fs::remove_file(&tmp);
+        // Hardlink geht nur vom echten Pfad; /proc/self/exe lässt sich nicht
+        // linken, aber kopieren — und das trägt auch dann noch, wenn das
+        // Original unter seinem Pfad längst gelöscht ist.
+        let ok = std::fs::hard_link(exe, &tmp).is_ok()
+            || std::fs::copy(exe, &tmp).is_ok()
+            || std::fs::copy(running, &tmp).is_ok();
+        if ok {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+        }
+        if !ok || std::fs::rename(&tmp, &link).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            // Ein vorhandener (womöglich älterer) Link ist immer noch besser als
+            // ein Pfad, den es nicht mehr gibt.
+            return if link.exists() { link.display().to_string() } else { exe.to_string() };
         }
     }
     link.display().to_string()
+}
+
+/// Pfad des eigenen Binaries, brauchbar als Hardlink-Quelle.
+///
+/// `current_exe()` hängt " (deleted)" an, sobald die Datei ersetzt wurde — nach
+/// jedem `cargo build` also, und nach jedem Plugin-Update. Ungeschnitten ist der
+/// Pfad wertlos: kein Link, keine Kopie, und ein Streamer, der damit startet,
+/// hätte gar kein Binary mehr.
+pub(crate) fn own_exe_path() -> String {
+    let p = std::env::current_exe().unwrap_or_else(|_| "herdr-mirror".into());
+    let p = std::fs::canonicalize(&p).unwrap_or(p);
+    let s = p.display().to_string();
+    s.strip_suffix(" (deleted)").unwrap_or(s.as_str()).to_string()
 }
 
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
@@ -504,9 +541,7 @@ pub(crate) fn cmd_for_pane(
     sizes: &HashMap<String, LayoutRect>,
     agents: &HashMap<String, String>,
 ) -> impl Fn(&str) -> Vec<String> {
-    let exe = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "herdr-mirror".into());
+    let exe = own_exe_path();
     let agents = agents.clone();
     let state_dir_owned = state_dir.to_path_buf();
     let target = host.target.clone();
@@ -1950,6 +1985,33 @@ mod tests {
             streamer_exe(&dir, &exe, Some("claude")),
             streamer_exe(&dir, &exe, Some("claude"))
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ist die Quelle unter ihrem Pfad verschwunden — nach jedem `cargo build`
+    /// der Normalfall, der Daemon läuft dann als "(deleted)" weiter —, darf der
+    /// vorhandene Link NICHT verloren gehen. Vorher wurde er erst gelöscht und
+    /// dann nicht wieder angelegt; jeder Streamer, der sich danach umbenennen
+    /// wollte, lief ins Leere und blieb stumm unter dem falschen Namen.
+    #[test]
+    fn streamer_exe_ueberlebt_eine_geloeschte_quelle() {
+        let dir = std::env::temp_dir().join(format!("herdr-mirror-del-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let exe = dir.join("herdr-mirror-quelle");
+        std::fs::write(&exe, b"#!/bin/true\n").unwrap();
+        let exe = exe.display().to_string();
+
+        let vorher = streamer_exe(&dir, &exe, Some("codex"));
+        assert!(vorher.ends_with("/bin/codex"));
+        std::fs::remove_file(&exe).unwrap();
+
+        // Der Link bleibt und bleibt benutzbar — der Rückfall auf /proc/self/exe
+        // legt ihn notfalls neu an, aber niemals gibt es ein Loch dazwischen.
+        let nachher = streamer_exe(&dir, &exe, Some("codex"));
+        assert_eq!(nachher, vorher, "Link muss erhalten bleiben");
+        assert!(std::path::Path::new(&nachher).exists(), "Link zeigt ins Leere");
+        // und kein Zwischenstand bleibt liegen
+        assert!(!dir.join("bin").join(".codex.neu").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
