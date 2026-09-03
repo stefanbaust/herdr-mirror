@@ -509,6 +509,11 @@ pub(crate) fn cmd_for_pane(
                 (rect.height + OBSERVE_MARGIN_ROWS).to_string(),
             ]);
         }
+        // Marker ganz zum Schluss: er macht die Wiedererkennung unabhängig vom
+        // Dateinamen (siehe daemon::is_streamer_argv), darf aber die POSITIONEN
+        // nicht verschieben — spawn_streamer_pane liest argv[2] als ssh-Ziel und
+        // argv[3] als Pane-Ziel.
+        argv.push("--mirror-streamer".into());
         argv
     }
 }
@@ -1860,6 +1865,7 @@ mod tests {
                 "--always-control",
                 "--ctl-path",
                 "/state/vps.ctl",
+                "--mirror-streamer",
             ]
         );
         // argv[0] is the resolved exe path, which varies by install
@@ -1885,6 +1891,7 @@ mod tests {
                 "--always-control",
                 "--ctl-path",
                 "/state/vps.ctl",
+                "--mirror-streamer",
             ]
         );
     }
@@ -1906,6 +1913,7 @@ mod tests {
                 "--always-control",
                 "--ctl-path",
                 "/state/vps.ctl",
+                "--mirror-streamer",
             ]
         );
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
@@ -1935,6 +1943,7 @@ mod tests {
                 "/Users/n/proj",
                 "--docker-bin",
                 "/usr/local/bin/docker",
+                "--mirror-streamer",
             ]
         );
     }
@@ -1971,7 +1980,7 @@ mod tests {
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
-            ["pane", "vps", "w1:p1", "--ctl-path", "/state/vps.ctl"]
+            ["pane", "vps", "w1:p1", "--ctl-path", "/state/vps.ctl", "--mirror-streamer"]
         );
     }
 

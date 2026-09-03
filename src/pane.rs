@@ -144,6 +144,10 @@ pub fn parse_args(argv: &[String]) -> Result<Args> {
             "--container-folder" => container_folder = Some(next("--container-folder")?),
             "--docker-bin" => docker_bin = next("--docker-bin")?,
             "--dump" => args.dump = true,
+            // Reiner Marker im argv: so erkennt der Daemon seine Streamer, ohne
+            // sich auf den DATEINAMEN des Binaries zu verlassen (siehe
+            // daemon::is_streamer_argv). Trägt keine Bedeutung für den Lauf.
+            "--mirror-streamer" => {}
             other if other.starts_with('-') => return Err(err(format!("unknown option: {other}"))),
             other => positional.push(other.to_string()),
         }

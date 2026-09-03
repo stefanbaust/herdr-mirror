@@ -416,8 +416,15 @@ fn streamer_recovery_needed(process_info_live: Option<bool>, pidfile_live: bool)
 /// subcommand so an unrelated `herdr-mirror status` in the pane is not mistaken
 /// for a live stream.
 fn is_streamer_argv(argv: &[Value]) -> bool {
-    argv.first().and_then(|s| s.as_str()).is_some_and(|e| e.ends_with("herdr-mirror"))
-        && argv.get(1).and_then(|s| s.as_str()) == Some("pane")
+    if argv.get(1).and_then(|s| s.as_str()) != Some("pane") {
+        return false;
+    }
+    // Bevorzugt der explizite Marker: er überlebt es, wenn das Binary unter
+    // einem anderen Dateinamen läuft. Der Dateinamens-Test bleibt als Rückfall,
+    // damit ein Daemon-Update die bereits laufenden Streamer der vorigen
+    // Fassung nicht aus den Augen verliert.
+    argv.iter().any(|s| s.as_str() == Some("--mirror-streamer"))
+        || argv.first().and_then(|s| s.as_str()).is_some_and(|e| e.ends_with("herdr-mirror"))
 }
 
 /// After a local herdr server restart, session-restore resurrects mirror panes
@@ -977,6 +984,30 @@ mod tests {
         ])));
         // and a pre-v0.1.7 streamer, which carried no identity flag at all
         assert!(is_streamer_argv(&argv(&["/usr/local/bin/herdr-mirror", "pane", "vps", "w1:p1"])));
+    }
+
+    /// Der Marker macht die Erkennung unabhängig vom DATEINAMEN des Binaries.
+    /// Das ist die Voraussetzung dafür, einen Streamer unter einem anderen
+    /// Namen zu starten, ohne dass der Daemon ihn aus den Augen verliert.
+    #[test]
+    fn marker_survives_a_renamed_binary() {
+        assert!(is_streamer_argv(&argv(&[
+            "/home/agent/.local/lib/herdr-mirror/claude",
+            "pane",
+            "hans",
+            "w1:p1",
+            "--container",
+            "worker-hans",
+            "--mirror-streamer",
+        ])));
+        // ohne Marker ist derselbe umbenannte Aufruf NICHT erkennbar — genau
+        // die Lücke, die der Marker schließt
+        assert!(!is_streamer_argv(&argv(&[
+            "/home/agent/.local/lib/herdr-mirror/claude",
+            "pane",
+            "hans",
+            "w1:p1",
+        ])));
     }
 
     /// A shell left behind by session-restore is what healing must act on.
