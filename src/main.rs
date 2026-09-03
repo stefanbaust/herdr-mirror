@@ -35,6 +35,7 @@ mod util;
 use util::{Env, Result};
 
 fn main() {
+    restore_default_sigpipe();
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("status");
     let code = match run(cmd, &args[1..]) {
@@ -49,6 +50,29 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// Die Rust-Laufzeit ignoriert SIGPIPE, damit Schreibfehler als `io::Error`
+/// sichtbar werden. Für ein CLI ist das die falsche Voreinstellung: `println!`
+/// paniert dann auf EPIPE, und der Prozess endet mit Exit 101 statt still zu
+/// sterben. Das trifft jede Pipe, deren Leser früh schließt — `herdr-mirror
+/// status | grep -q ...` oder `| head` genügt schon.
+///
+/// Gemessen: `herdr-mirror status | grep -q '^daemon: running'` endete in vier
+/// von fünf Läufen mit 101 — samt Panic-Meldung auf stderr.
+///
+/// Was das NICHT heilt: unter `set -o pipefail` bleibt eine solche Pipeline auch
+/// mit 141 ungleich 0, taugt also weiterhin nicht als Bedingung. Das ist
+/// allgemeines Unix-Verhalten und nicht zu reparieren; Aufrufer lesen die
+/// Ausgabe erst in eine Variable. Hier geht es allein darum, dass ein
+/// geschlossener Leser kein Panic mehr ist — `… | head -1` verhält sich jetzt
+/// wie bei jedem anderen Kommandozeilenwerkzeug.
+fn restore_default_sigpipe() {
+    // SAFETY: setzt einen Signal-Handler auf den POSIX-Standard zurück, bevor
+    // Threads laufen — genau der Weg, den auch andere CLIs in Rust gehen.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
 }
 
 fn run(cmd: &str, rest: &[String]) -> Result<()> {
