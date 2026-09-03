@@ -435,16 +435,80 @@ pub struct ConvergeDeps {
     pub closes: crate::closes::Closes,
 }
 
+/// Pfad, unter dem der Streamer einer Pane laufen soll.
+///
+/// herdr vergibt Agenten-Autorität nach dem NAMEN des Vordergrundprozesses der
+/// Pane. Auf einer Spiegel-Pane ist das der Streamer — heißt er nicht wie der
+/// entfernte Agent, lehnt herdr `agent.prompt`/`agent.send-keys` mit
+/// `agent_not_ready` ab und nimmt auch keine Agenten-Session an. Läuft entfernt
+/// gar kein Agent, bleibt es beim eigenen Namen; sonst meldete jede leere Pane
+/// einen Agenten, den es nicht gibt.
+///
+/// Ein Symlink genügt NICHT: der Kernel nimmt `comm` vom aufgelösten
+/// Dateinamen, ein Symlink hieße für ihn weiter herdr-mirror.
+pub(crate) fn streamer_exe(
+    state_dir: &std::path::Path,
+    exe: &str,
+    agent: Option<&str>,
+) -> String {
+    // Auch ohne Agenten wird verlinkt, nur unter dem eigenen Namen. Sonst zeigte
+    // der Streamer nach einem Wechsel weiter auf den Agenten-Link: Hardlinks
+    // sind vom Original nicht zu unterscheiden, ein "zurück zum echten Binary"
+    // gäbe es also nicht.
+    let name = agent.unwrap_or("herdr-mirror");
+    // Der Name landet als Dateiname im Dateisystem und als Prozessname in der
+    // Erkennung — nur harmlose Zeichen, und nichts, was aus dem Verzeichnis
+    // ausbricht.
+    if name.is_empty()
+        || name.len() > 32
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return exe.to_string();
+    }
+    let agent = name;
+    let dir = state_dir.join("bin");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return exe.to_string();
+    }
+    let link = dir.join(agent);
+    // Ein vorhandener Link kann auf ein ALTES Binary zeigen (Plugin-Update), also
+    // jedes Mal neu setzen. Gleiche Inode = nichts zu tun.
+    let same = std::fs::metadata(&link).ok().zip(std::fs::metadata(exe).ok()).is_some_and(
+        |(a, b)| {
+            use std::os::unix::fs::MetadataExt;
+            a.dev() == b.dev() && a.ino() == b.ino()
+        },
+    );
+    if !same {
+        let _ = std::fs::remove_file(&link);
+        if std::fs::hard_link(exe, &link).is_err() {
+            // getrennte Dateisysteme: Kopie tut es auch, der Name zählt
+            if std::fs::copy(exe, &link).is_err() {
+                return exe.to_string();
+            }
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    link.display().to_string()
+}
+
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
 /// known size get no --cols/--rows (the wrapper falls back to a default).
+///
+/// `agents` bildet entfernte Pane-IDs auf den dort laufenden Agenten ab; danach
+/// richtet sich der Dateiname, unter dem der Streamer startet (s. streamer_exe).
 pub(crate) fn cmd_for_pane(
     host: &HostConfig,
     state_dir: &std::path::Path,
     sizes: &HashMap<String, LayoutRect>,
+    agents: &HashMap<String, String>,
 ) -> impl Fn(&str) -> Vec<String> {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "herdr-mirror".into());
+    let agents = agents.clone();
+    let state_dir_owned = state_dir.to_path_buf();
     let target = host.target.clone();
     let remote_bin = host.remote_bin.clone();
     let session = host.session.clone();
@@ -461,7 +525,7 @@ pub(crate) fn cmd_for_pane(
     let sizes = sizes.clone();
     move |pane_id: &str| {
         let mut argv = vec![
-            exe.clone(),
+            streamer_exe(&state_dir_owned, &exe, agents.get(pane_id).map(String::as_str)),
             "pane".into(),
             target.clone(),
             pane_id.to_string(),
@@ -842,7 +906,16 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
             sizes.insert(p.pane_id.clone(), p.rect.clone());
         }
     }
-    let cmd_for = cmd_for_pane(&deps.host, &deps.state_dir, &sizes);
+    // Welcher Agent läuft entfernt in welcher Pane — daraus wird der Dateiname
+    // des Streamers (s. streamer_exe). Quelle ist der frische Snapshot, nicht
+    // der gespeicherte Zustand: ein gerade gestarteter Agent soll beim nächsten
+    // Spawn schon den richtigen Namen bekommen.
+    let agents: HashMap<String, String> = remote_snap
+        .agents
+        .iter()
+        .filter_map(|a| a.agent.clone().map(|name| (a.pane_id.clone(), name)))
+        .collect();
+    let cmd_for = cmd_for_pane(&deps.host, &deps.state_dir, &sizes, &agents);
     let _ = std::fs::create_dir_all(mirror_pane_cwd(&deps.state_dir));
 
     // 1. detect mirrors that are gone locally. Always tombstone (never remove)
@@ -1850,10 +1923,40 @@ mod tests {
     ///
     /// If this test fails, that is the question to answer — not a prompt to
     /// update the expected value.
+    /// Der Streamer heißt wie der entfernte Agent — daran hängt, ob herdr der
+    /// Spiegel-Pane Agenten-Autorität gibt. Ohne Agent bleibt es beim eigenen
+    /// Namen, sonst meldete jede leere Pane einen Agenten, den es nicht gibt.
+    #[test]
+    fn streamer_exe_follows_the_remote_agent() {
+        let dir = std::env::temp_dir().join(format!("herdr-mirror-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let exe = dir.join("herdr-mirror");
+        std::fs::write(&exe, b"#!/bin/true\n").unwrap();
+        let exe = exe.display().to_string();
+
+        // ohne Agenten der eigene Name — aber aus demselben bin-Verzeichnis, damit
+        // ein Wechsel zurück überhaupt möglich ist (Hardlinks sind vom Original
+        // nicht unterscheidbar)
+        assert!(streamer_exe(&dir, &exe, None).ends_with("/bin/herdr-mirror"));
+        assert!(streamer_exe(&dir, &exe, Some("claude")).ends_with("/bin/claude"));
+        assert!(streamer_exe(&dir, &exe, Some("codex")).ends_with("/bin/codex"));
+        // Unsinnige oder gefährliche Namen fallen auf das Binary zurück, statt
+        // einen Pfad zu bauen, der aus dem Verzeichnis ausbricht.
+        for bad in ["", "../../etc/passwd", "a/b", "x".repeat(64).as_str()] {
+            assert_eq!(streamer_exe(&dir, &exe, Some(bad)), exe, "abgelehnt: {bad:?}");
+        }
+        // derselbe Aufruf zweimal ist stabil (Hardlink bleibt, keine Neuanlage)
+        assert_eq!(
+            streamer_exe(&dir, &exe, Some("claude")),
+            streamer_exe(&dir, &exe, Some("claude"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn ssh_pane_argv_is_stable() {
         let state_dir = std::path::Path::new("/state");
-        let cmd = cmd_for_pane(&ssh_host(), state_dir, &HashMap::new());
+        let cmd = cmd_for_pane(&ssh_host(), state_dir, &HashMap::new(), &HashMap::new());
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
@@ -1878,7 +1981,7 @@ mod tests {
     fn ssh_pane_argv_carries_explicit_remote_bin() {
         let mut host = ssh_host();
         host.remote_bin = Some("/opt/herdr".into());
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new(), &HashMap::new());
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
@@ -1900,7 +2003,7 @@ mod tests {
     fn ssh_pane_argv_carries_remote_session() {
         let mut host = ssh_host();
         host.session = Some("work".into());
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new(), &HashMap::new());
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
@@ -1929,7 +2032,7 @@ mod tests {
         host.target = "/Users/n/proj".into();
         host.kind = crate::config::HostKind::DockerFolder("/Users/n/proj".into());
         host.docker_bin = "/usr/local/bin/docker".into();
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new(), &HashMap::new());
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
@@ -1960,7 +2063,7 @@ mod tests {
         // absolute path (GUI-launched daemons without /usr/local/bin on PATH)
         // would then silently get "cannot run docker".
         host.docker_bin = "/usr/local/bin/docker".into();
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new(), &HashMap::new());
         let argv = cmd("w1:p1");
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
         assert_eq!(parsed.pane_target, "w1:p1");
@@ -1976,7 +2079,7 @@ mod tests {
     fn ssh_pane_argv_without_always_control() {
         let mut host = ssh_host();
         host.always_control = false;
-        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new());
+        let cmd = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new(), &HashMap::new());
         let argv = cmd("w1:p1");
         assert_eq!(
             argv[1..],
@@ -1990,12 +2093,12 @@ mod tests {
     fn size_caps_reach_the_streamer_argv() {
         let mut host = ssh_host();
         host.always_control = false;
-        let uncapped = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
+        let uncapped = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new(), &HashMap::new())("w1:p1");
         assert!(!uncapped.iter().any(|a| a == "--max-cols" || a == "--max-rows"));
 
         host.max_cols = Some(212);
         host.max_rows = Some(58);
-        let argv = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new())("w1:p1");
+        let argv = cmd_for_pane(&host, std::path::Path::new("/state"), &HashMap::new(), &HashMap::new())("w1:p1");
         let parsed = crate::pane::parse_args(&argv[2..]).expect("pane must parse daemon argv");
         assert_eq!(parsed.max_cols, Some(212));
         assert_eq!(parsed.max_rows, Some(58));

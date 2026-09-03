@@ -208,7 +208,7 @@ enum Msg {
     Stdin(Vec<u8>),
     /// result of a background foreground poll; None=poll failed (keep the last
     /// value)
-    Foreground(Option<Fg>),
+    Foreground(Option<(Fg, Option<String>)>),
     Paste(crate::paste::Outcome),
     Drop(crate::paste::DropResult),
 }
@@ -707,6 +707,9 @@ struct App {
     /// remote pane foreground classification, None=unknown (fail safe to local).
     /// Refreshed lazily on mouse activity; see `foreground::classify`.
     remote_fg: Option<Fg>,
+    /// Pfad des ECHTEN Binaries (nicht des Agentennamens-Links), damit ein
+    /// erneutes Umbenennen nicht auf einen Link zeigt, der selbst schon einer ist.
+    exe_original: String,
     /// local drag-selection, driven by the left button the remote app would
     /// otherwise receive
     select: Select,
@@ -739,6 +742,12 @@ struct App {
 /// minimum spacing between foreground polls — each is an ssh handshake, so we
 /// poll lazily (only around mouse activity) and no faster than this
 const FG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// Takt, in dem der Streamer von sich aus nachsieht, welcher Agent drüben läuft.
+/// Eine Abfrage ist ein `docker exec`/ssh-Aufruf, deshalb gemächlich — ein
+/// Agentenstart darf ein paar Sekunden brauchen, bis die Pane ihn zeigt.
+const AGENT_WATCH_INTERVAL: Duration = Duration::from_secs(10);
+
 
 /// after input settles, re-poll once this much later to catch a foreground
 /// change the input caused (e.g. a TUI just exited); bypasses FG_POLL_INTERVAL
@@ -840,6 +849,36 @@ impl App {
             .await;
             let _ = tx.send(Msg::Foreground(v)).await;
         });
+    }
+
+    /// Sich selbst unter dem Namen des entfernten Agenten ersetzen.
+    ///
+    /// herdr vergibt Agenten-Autorität nach dem NAMEN des Vordergrundprozesses
+    /// der Pane. Auf einer Spiegel-Pane ist das dieser Streamer: heißt er nicht
+    /// wie der Agent nebenan, lehnt herdr `agent.prompt` mit `agent_not_ready`
+    /// ab und nimmt auch keine Agenten-Session an. Startet oder endet drüben ein
+    /// Harness, muss der Name also nachziehen.
+    ///
+    /// Warum `exec` statt Neustart durch den Daemon: der Streamer IST der
+    /// Prozess der Pane. Ihn zu beenden schließt die Pane, und der Daemon
+    /// exec'te anschließend ins Leere (live erlitten — die Spiegel-Arbeitsfläche
+    /// verschwand). `exec` ersetzt nur das Prozessabbild; Pane, Dateideskriptoren
+    /// und Terminalgröße bleiben, der Stream baut sich neu auf.
+    fn reexec_under_agent_name(&mut self, agent: Option<&str>) {
+        use std::os::unix::process::CommandExt;
+        let Ok(current) = std::env::current_exe() else { return };
+        let Ok(env) = crate::util::Env::resolve() else { return };
+        // Der Zielname wird aus demselben Helfer abgeleitet, den auch der Daemon
+        // beim Anlegen benutzt — eine Quelle, keine zweite Meinung.
+        let want = crate::mirror::streamer_exe(&env.state_dir, &self.exe_original, agent);
+        if current.display().to_string() == want {
+            return;
+        }
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let err = std::process::Command::new(&want).args(&args).exec();
+        // exec kehrt nur im Fehlerfall zurück; dann läuft der alte Prozess
+        // einfach weiter — falscher Name, aber ein lebender Spiegel.
+        let _ = err;
     }
 
     /// Hold the local mouse grab for the streamer's whole lifetime. The pane
@@ -1517,6 +1556,11 @@ pub async fn run(args: Args) -> Result<()> {
         hint_clear_at: None,
         predict: Predictor::new(),
         remote_fg: None,
+        exe_original: std::fs::canonicalize(
+            std::env::current_exe().unwrap_or_else(|_| "herdr-mirror".into()),
+        )
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "herdr-mirror".into()),
         select: Select::new(),
         last_select_rows: None,
         fg_poll_at: None,
@@ -1567,6 +1611,12 @@ pub async fn run(args: Args) -> Result<()> {
             && !app.args.always_control
             && app.args.control_idle_secs > 0)
             .then(|| app.last_input + Duration::from_secs(app.args.control_idle_secs));
+        // Eigener Takt für die Vordergrund-Abfrage. Bisher lief sie nur bei
+        // Mausaktivität — auf einer ruhigen Spiegel-Pane also nie, und damit
+        // hätte der Streamer nie bemerkt, dass drüben ein Agent gestartet ist
+        // (nachgemessen: 90 s ohne Reaktion). Am Namen hängt die
+        // Agenten-Autorität der Pane, siehe reexec_under_agent_name.
+        let agent_watch_at = Some(app.fg_poll_at.unwrap_or_else(Instant::now) + AGENT_WATCH_INTERVAL);
         let sleep = crate::util::sleep_until_earliest([
             app.switch_at,
             app.reconnect_at.map(|(t, _)| t),
@@ -1574,6 +1624,7 @@ pub async fn run(args: Args) -> Result<()> {
             idle_at,
             app.predict.deadline(),
             app.settle_at,
+            agent_watch_at,
         ]);
 
         tokio::select! {
@@ -1584,7 +1635,13 @@ pub async fn run(args: Args) -> Result<()> {
                     Some(Msg::SessionExit { gen, mode, reason, uptime }) => app.handle_exit(gen, mode, reason, uptime),
                     Some(Msg::Stdin(buf)) => app.handle_stdin(buf).await,
                     // keep the last good classification if a poll failed (None)
-                    Some(Msg::Foreground(v)) => if v.is_some() {
+                    Some(Msg::Foreground(v)) => if let Some((fg, agent)) = v {
+                        let v = Some(fg);
+                        // Heißt der eigene Prozess nicht mehr wie der entfernte
+                        // Agent, ersetzt sich der Streamer an Ort und Stelle
+                        // (siehe reexec_under_agent_name). Kehrt nicht zurück,
+                        // wenn es klappt.
+                        app.reexec_under_agent_name(agent.as_deref());
                         // a foreground change means the screen belongs to a
                         // different program now, so the old highlight points at
                         // text that is gone
@@ -1629,6 +1686,11 @@ pub async fn run(args: Args) -> Result<()> {
             _ = sighup.recv() => break,
             _ = sleep => {
                 let now = Instant::now();
+                // eigener Takt: nachsehen, welches Harness drüben läuft, damit
+                // der Streamer seinen Namen nachziehen kann (s. AGENT_WATCH_INTERVAL)
+                if app.fg_poll_at.is_none_or(|t| now.duration_since(t) >= AGENT_WATCH_INTERVAL) {
+                    app.spawn_foreground_poll(true);
+                }
                 if app.switch_at.is_some_and(|t| t <= now) {
                     app.switch_at = None;
                     if let Some(m) = app.switching_to.take() {

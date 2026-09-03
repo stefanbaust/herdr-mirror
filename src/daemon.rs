@@ -484,7 +484,14 @@ async fn heal_zombie_mirrors(
         //
         // Sizes live in the remote layout, which we don't have here; the wrapper
         // falls back to its default and the next converge reconciles.
-        let cmd_for = crate::mirror::cmd_for_pane(h, state_dir, &HashMap::new());
+        // Beim Heilen kennen wir den entfernten Agenten aus dem gespeicherten
+        // Zustand; ein Snapshot liegt hier nicht vor.
+        let agents: HashMap<String, String> = state
+            .panes
+            .iter()
+            .filter_map(|(rid, e)| e.reported.clone().map(|a| (rid.clone(), a)))
+            .collect();
+        let cmd_for = crate::mirror::cmd_for_pane(h, state_dir, &HashMap::new(), &agents);
         for (remote_pane_id, local_pane_id) in dead {
             let argv = cmd_for(&remote_pane_id);
             crate::mirror::spawn_streamer_pane(local, state_dir, &local_pane_id, &argv, log).await;

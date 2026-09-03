@@ -62,6 +62,16 @@ pub enum Fg {
 /// It also fixes the leaf problem for free: `process-info` returns the whole
 /// foreground process GROUP, so an agent's leaf is whatever tool it just spawned
 /// (`node`, `rg`, `bash`) and moves every few seconds. `agent` does not move.
+/// Name des Agenten, den herdr in der ENTFERNTEN Pane sieht (`claude`, `codex`,
+/// …) — die Grundlage dafür, unter welchem Dateinamen der Streamer laufen muss
+/// (siehe mirror::streamer_exe). Wie bei `classify` beantwortet die Frage herdr,
+/// nicht wir: eine eigene Liste wäre eine schlechtere Kopie und veraltet, sobald
+/// ein neues Harness erscheint.
+pub fn agent_name(pane_json: &str) -> Option<String> {
+    let pane: serde_json::Value = serde_json::from_str(pane_json).ok()?;
+    Some(pane.get("result")?.get("pane")?.get("agent")?.as_str()?.to_string())
+}
+
 pub fn classify(pane_json: &str, proc_json: &str) -> Option<Fg> {
     let pane: serde_json::Value = serde_json::from_str(pane_json).ok()?;
     if pane.get("result")?.get("pane")?.get("agent").and_then(|v| v.as_str()).is_some() {
@@ -84,7 +94,7 @@ pub async fn poll(
     pane: &str,
     ctl_path: Option<&str>,
     container: Option<&crate::pane::ContainerArg>,
-) -> Option<Fg> {
+) -> Option<(Fg, Option<String>)> {
     // same expression as the observe session (configured path or PATH auto)
     let bin = crate::config::remote_herdr_expr(remote_bin, session);
     // both answers in ONE hop: same ssh round trip cost as the old single query
@@ -133,7 +143,7 @@ pub async fn poll(
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let (pane_json, proc_json) = text.split_once("<<>>")?;
-    classify(pane_json, proc_json)
+    Some((classify(pane_json, proc_json)?, agent_name(pane_json)))
 }
 
 #[cfg(test)]
