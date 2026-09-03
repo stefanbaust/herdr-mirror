@@ -435,6 +435,22 @@ pub struct ConvergeDeps {
     pub closes: crate::closes::Closes,
 }
 
+/// SPIKE: harten Link mit Agentennamen auf das eigene Binary anlegen und dessen
+/// Pfad zurückgeben. Ein Symlink genügt NICHT — der Kernel nimmt `comm` vom
+/// aufgelösten Dateinamen, ein Symlink hieße für ihn weiterhin herdr-mirror.
+fn agent_named_exe(state_dir: &std::path::Path, exe: &str) -> Option<String> {
+    let dir = state_dir.join("bin");
+    std::fs::create_dir_all(&dir).ok()?;
+    let link = dir.join("claude");
+    if link.exists() {
+        std::fs::remove_file(&link).ok()?;
+    }
+    std::fs::hard_link(exe, &link)
+        .or_else(|_| std::fs::copy(exe, &link).map(|_| ()))
+        .ok()?;
+    Some(link.display().to_string())
+}
+
 /// argv for one mirror pane: this same binary in `pane` mode. Panes without a
 /// known size get no --cols/--rows (the wrapper falls back to a default).
 pub(crate) fn cmd_for_pane(
@@ -445,6 +461,13 @@ pub(crate) fn cmd_for_pane(
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "herdr-mirror".into());
+    // SPIKE: den Streamer unter dem Namen eines Agenten starten. herdr vergibt
+    // Agenten-Autorität nach dem NAMEN des Vordergrundprozesses der Pane; heißt
+    // der Prozess "claude", sollten agent.prompt/agent.send-keys auf der
+    // Spiegel-Pane funktionieren statt mit agent_not_ready abzulehnen.
+    // Vorerst fest verdrahtet — die richtige Fassung müsste dem entfernten
+    // Harness folgen (claude/codex/…) und beim Wechsel neu starten.
+    let exe = agent_named_exe(state_dir, &exe).unwrap_or(exe);
     let target = host.target.clone();
     let remote_bin = host.remote_bin.clone();
     let session = host.session.clone();
